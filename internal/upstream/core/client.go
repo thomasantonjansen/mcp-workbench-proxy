@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -332,6 +333,10 @@ func (c *Client) ListTools(ctx context.Context) ([]*config.ToolMetadata, error) 
 		// contract hash; a tool with no declared schema yields "", making validation a
 		// no-op (FR-A7).
 		outputSchemaJSON := captureOutputSchemaJSON(tool)
+		rawToolJSON := ""
+		if raw, marshalErr := json.Marshal(tool); marshalErr == nil {
+			rawToolJSON = string(raw)
+		}
 
 		toolMeta := &config.ToolMetadata{
 			ServerName:       c.config.Name,
@@ -339,6 +344,7 @@ func (c *Client) ListTools(ctx context.Context) ([]*config.ToolMetadata, error) 
 			Description:      tool.Description,
 			ParamsJSON:       paramsJSON,
 			OutputSchemaJSON: outputSchemaJSON,
+			RawToolJSON:      rawToolJSON,
 		}
 
 		// Copy tool annotations if any are set
@@ -435,6 +441,9 @@ func (c *Client) CallTool(ctx context.Context, toolName string, args map[string]
 	} else {
 		timeout = 2 * time.Minute // Default fallback
 	}
+	if c.config != nil && c.config.CallToolTimeout != nil && c.config.CallToolTimeout.Duration() > 0 {
+		timeout = c.config.CallToolTimeout.Duration()
+	}
 
 	// If the provided context doesn't have a timeout, add one
 	callCtx := ctx
@@ -461,6 +470,10 @@ func (c *Client) CallTool(ctx context.Context, toolName string, args map[string]
 		// Provide more specific error context
 		if callCtx.Err() == context.DeadlineExceeded {
 			return nil, fmt.Errorf("CallTool '%s' timed out after %v", toolName, timeout)
+		}
+		var protocolErr *mcp.JSONRPCErrorDetailsError
+		if errors.As(err, &protocolErr) {
+			return nil, protocolErr
 		}
 
 		// Extra diagnostics for broken pipe/closed pipe

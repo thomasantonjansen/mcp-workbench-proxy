@@ -264,7 +264,7 @@ func TestActivityRequest_InvalidID(t *testing.T) {
 	// Verify URL parsing - chi would normally extract the param
 	assert.Equal(t, http.MethodGet, req.Method)
 	assert.Empty(t, req.URL.Query().Get("id")) // No query param
-	_ = rr // Would check response after handler call
+	_ = rr                                     // Would check response after handler call
 }
 
 // =============================================================================
@@ -273,11 +273,11 @@ func TestActivityRequest_InvalidID(t *testing.T) {
 
 func TestParseActivityFilters_SensitiveDataFilters(t *testing.T) {
 	tests := []struct {
-		name            string
-		query           string
-		wantSensitive   *bool
-		wantDetType     string
-		wantSeverity    string
+		name          string
+		query         string
+		wantSensitive *bool
+		wantDetType   string
+		wantSeverity  string
 	}{
 		{
 			name:          "sensitive_data=true filter",
@@ -511,9 +511,9 @@ func TestExtractSensitiveDataInfo(t *testing.T) {
 
 func TestCalculateMaxSeverity(t *testing.T) {
 	tests := []struct {
-		name       string
-		detection  map[string]interface{}
-		wantMax    string
+		name      string
+		detection map[string]interface{}
+		wantMax   string
 	}{
 		{
 			name: "mixed severities - critical wins",
@@ -544,9 +544,9 @@ func TestCalculateMaxSeverity(t *testing.T) {
 			wantMax: "",
 		},
 		{
-			name:    "nil detections",
+			name:      "nil detections",
 			detection: map[string]interface{}{},
-			wantMax: "",
+			wantMax:   "",
 		},
 		{
 			name: "unknown severity ignored",

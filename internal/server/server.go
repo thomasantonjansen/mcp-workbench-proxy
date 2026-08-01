@@ -65,6 +65,8 @@ type Server struct {
 	running         bool
 	listenAddr      string
 	mu              sync.RWMutex
+	scopedHTTPMu    sync.Mutex
+	scopedHTTP      map[string]scopedHTTPEntry
 
 	serverCtx    context.Context
 	serverCancel context.CancelFunc
@@ -92,6 +94,11 @@ type Server struct {
 	// MCP-32: observability manager (Prometheus /metrics + OTLP tracing).
 	// Nil when disabled; config-gated and off by default.
 	observability *observability.Manager
+}
+
+type scopedHTTPEntry struct {
+	mcp     *server.MCPServer
+	handler http.Handler
 }
 
 // NewServer creates a new server instance
@@ -195,6 +202,7 @@ func NewServerWithConfigPath(cfg *config.Config, configPath string, logger *zap.
 	mcpProxy.SetObservability(obsManager)
 
 	server.mcpProxy = mcpProxy
+	mcpProxy.RefreshScopedServers()
 
 	go server.forwardRuntimeStatus()
 	go server.listenForRoutingModeRefresh()
@@ -443,6 +451,7 @@ func (s *Server) listenForRoutingModeRefresh() {
 			if s.mcpProxy != nil {
 				s.mcpProxy.RefreshDirectModeTools()
 				s.mcpProxy.RefreshCodeExecModeTools()
+				s.mcpProxy.RefreshScopedServers()
 			}
 		case runtime.EventTypeConfigReloaded:
 			// Spec 077 US3: config hot-reload (file edit or /api/v1/config/apply)
@@ -450,6 +459,9 @@ func (s *Server) listenForRoutingModeRefresh() {
 			// effect without a restart. Fires on both reload paths, which both
 			// emit config.reloaded.
 			s.reapplyScannerSecurityConfig()
+			if s.mcpProxy != nil {
+				s.mcpProxy.RefreshScopedServers()
+			}
 		}
 	}
 }
@@ -1881,6 +1893,7 @@ func (s *Server) startCustomHTTPServer(ctx context.Context, streamableServer *se
 	loggingHandler := func(handler http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
+			r = r.WithContext(withProtocolSessionID(r.Context(), r.Header.Get("Mcp-Session-Id")))
 
 			// Extract connection source from context
 			source := GetConnectionSource(r.Context())
@@ -1928,54 +1941,113 @@ func (s *Server) startCustomHTTPServer(ctx context.Context, streamableServer *se
 		})
 	}
 
-	// Standard MCP endpoint according to the specification
-	// Wrap with auth middleware to inject AuthContext for agent token scope enforcement.
-	// hostValidationMiddleware (outermost) replaces mcp-go's DNS-rebinding
-	// protection — disabled on every StreamableHTTPServer below — adding the
-	// trusted_hosts allowlist for reverse-proxy deployments (GH #898).
-	mcpHandler := s.hostValidationMiddleware(s.mcpAuthMiddleware(loggingHandler(streamableServer)))
-	mux.Handle("/mcp", mcpHandler)
-	mux.Handle("/mcp/", mcpHandler) // Handle trailing slash
+	// The controller minimal edition intentionally has no aggregate MCP
+	// endpoint. Each upstream is a distinct MCP server for clients.
+	var mcpHandler http.Handler
+	if cfg.MinimalMode {
+		scopedHandler := func(controller bool, prefix string) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				serverID := strings.Trim(strings.TrimPrefix(r.URL.Path, prefix), "/")
+				if serverID == "" || strings.Contains(serverID, "/") {
+					http.Error(w, "MCP server id is required", http.StatusNotFound)
+					return
+				}
+				if controller {
+					current, _ := s.GetConfig()
+					expected := ""
+					if current != nil {
+						expected = current.APIKey
+					}
+					if token := httpapi.ExtractToken(r); expected == "" || token != expected {
+						http.Error(w, "Unauthorized", http.StatusUnauthorized)
+						return
+					}
+				}
+				target := s.mcpProxy.GetScopedServer(serverID, controller)
+				if target == nil {
+					http.Error(w, "MCP server was not found", http.StatusNotFound)
+					return
+				}
+				cacheKey := fmt.Sprintf("%t:%s", controller, serverID)
+				s.scopedHTTPMu.Lock()
+				entry := s.scopedHTTP[cacheKey]
+				if entry.mcp != target || entry.handler == nil {
+					transport := server.NewStreamableHTTPServer(target, server.WithDisableLocalhostProtection(true))
+					handler := loggingHandler(transport)
+					if !controller {
+						handler = s.mcpAuthMiddleware(handler)
+					}
+					handler = s.hostValidationMiddleware(handler)
+					entry = scopedHTTPEntry{mcp: target, handler: handler}
+					if s.scopedHTTP == nil {
+						s.scopedHTTP = map[string]scopedHTTPEntry{}
+					}
+					s.scopedHTTP[cacheKey] = entry
+				}
+				s.scopedHTTPMu.Unlock()
+				entry.handler.ServeHTTP(w, r)
+			})
+		}
+		mux.Handle("/mcp/servers/", scopedHandler(false, "/mcp/servers/"))
+		mux.Handle("/mcp/controller/", scopedHandler(true, "/mcp/controller/"))
+		mux.HandleFunc("/mcp", func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "Use a server-specific MCP endpoint", http.StatusNotFound)
+		})
+		mux.HandleFunc("/mcp/", func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "Use a server-specific MCP endpoint", http.StatusNotFound)
+		})
+	} else {
+		// Standard MCP endpoint according to the upstream edition.
+		mcpHandler = s.hostValidationMiddleware(s.mcpAuthMiddleware(loggingHandler(streamableServer)))
+		mux.Handle("/mcp", mcpHandler)
+		mux.Handle("/mcp/", mcpHandler)
+	}
 
 	// Routing mode dedicated endpoints (Spec 031)
 	// Each endpoint always serves its specific routing mode regardless of config.
 	// /mcp/all → direct mode (all tools with serverName__toolName naming)
-	directStreamable := server.NewStreamableHTTPServer(s.mcpProxy.GetMCPServerForMode(config.RoutingModeDirect),
-		server.WithDisableLocalhostProtection(true))
-	directHandler := s.hostValidationMiddleware(s.mcpAuthMiddleware(loggingHandler(directStreamable)))
-	mux.Handle("/mcp/all", directHandler)
-	mux.Handle("/mcp/all/", directHandler)
+	if !cfg.MinimalMode {
+		directStreamable := server.NewStreamableHTTPServer(s.mcpProxy.GetMCPServerForMode(config.RoutingModeDirect),
+			server.WithDisableLocalhostProtection(true))
+		directHandler := s.hostValidationMiddleware(s.mcpAuthMiddleware(loggingHandler(directStreamable)))
+		mux.Handle("/mcp/all", directHandler)
+		mux.Handle("/mcp/all/", directHandler)
 
-	// /mcp/code → code_execution mode (JS orchestration)
-	codeExecStreamable := server.NewStreamableHTTPServer(s.mcpProxy.GetMCPServerForMode(config.RoutingModeCodeExecution),
-		server.WithDisableLocalhostProtection(true))
-	codeExecHandler := s.hostValidationMiddleware(s.mcpAuthMiddleware(loggingHandler(codeExecStreamable)))
-	mux.Handle("/mcp/code", codeExecHandler)
-	mux.Handle("/mcp/code/", codeExecHandler)
+		// /mcp/code → code_execution mode (JS orchestration)
+		codeExecStreamable := server.NewStreamableHTTPServer(s.mcpProxy.GetMCPServerForMode(config.RoutingModeCodeExecution),
+			server.WithDisableLocalhostProtection(true))
+		codeExecHandler := s.hostValidationMiddleware(s.mcpAuthMiddleware(loggingHandler(codeExecStreamable)))
+		mux.Handle("/mcp/code", codeExecHandler)
+		mux.Handle("/mcp/code/", codeExecHandler)
 
-	// /mcp/call → retrieve_tools mode (focused: retrieve_tools + call_tool_read/write/destructive)
-	callToolStreamable := server.NewStreamableHTTPServer(s.mcpProxy.GetMCPServerForMode(config.RoutingModeRetrieveTools),
-		server.WithDisableLocalhostProtection(true))
-	callToolHandler := s.hostValidationMiddleware(s.mcpAuthMiddleware(loggingHandler(callToolStreamable)))
-	mux.Handle("/mcp/call", callToolHandler)
-	mux.Handle("/mcp/call/", callToolHandler)
+		// /mcp/call → retrieve_tools mode (focused: retrieve_tools + call_tool_read/write/destructive)
+		callToolStreamable := server.NewStreamableHTTPServer(s.mcpProxy.GetMCPServerForMode(config.RoutingModeRetrieveTools),
+			server.WithDisableLocalhostProtection(true))
+		callToolHandler := s.hostValidationMiddleware(s.mcpAuthMiddleware(loggingHandler(callToolStreamable)))
+		mux.Handle("/mcp/call", callToolHandler)
+		mux.Handle("/mcp/call/", callToolHandler)
 
-	// /mcp/p/<slug> → profile-scoped retrieve_tools mode (Spec 057)
-	// Profile resolution is done by profileMiddleware which runs AFTER mcpAuthMiddleware
-	// so that agent-token scope can compose downstream with the profile scope.
-	profileStreamable := server.NewStreamableHTTPServer(s.mcpProxy.GetMCPServerForMode(config.RoutingModeRetrieveTools),
-		server.WithDisableLocalhostProtection(true))
-	profileHandler := s.hostValidationMiddleware(s.mcpAuthMiddleware(s.profileMiddleware(loggingHandler(profileStreamable))))
-	mux.Handle("/mcp/p/", profileHandler)
-	mux.Handle("/mcp/p", profileHandler)
+		// /mcp/p/<slug> → profile-scoped retrieve_tools mode (Spec 057)
+		// Profile resolution is done by profileMiddleware which runs AFTER mcpAuthMiddleware
+		// so that agent-token scope can compose downstream with the profile scope.
+		profileStreamable := server.NewStreamableHTTPServer(s.mcpProxy.GetMCPServerForMode(config.RoutingModeRetrieveTools),
+			server.WithDisableLocalhostProtection(true))
+		profileHandler := s.hostValidationMiddleware(s.mcpAuthMiddleware(s.profileMiddleware(loggingHandler(profileStreamable))))
+		mux.Handle("/mcp/p/", profileHandler)
+		mux.Handle("/mcp/p", profileHandler)
 
-	s.logger.Info("Registered routing mode MCP endpoints",
-		zap.String("default_mode", cfg.RoutingMode),
-		zap.Strings("endpoints", []string{"/mcp/all", "/mcp/code", "/mcp/call", "/mcp/p/<slug>"}))
+		s.logger.Info("Registered routing mode MCP endpoints",
+			zap.String("default_mode", cfg.RoutingMode),
+			zap.Strings("endpoints", []string{"/mcp/all", "/mcp/code", "/mcp/call", "/mcp/p/<slug>"}))
 
-	// Legacy endpoints for backward compatibility
-	mux.Handle("/v1/tool_code", mcpHandler)
-	mux.Handle("/v1/tool-code", mcpHandler) // Alias for python client
+		// Legacy endpoints for backward compatibility
+		mux.Handle("/v1/tool_code", mcpHandler)
+		mux.Handle("/v1/tool-code", mcpHandler) // Alias for python client
+	}
+	if cfg.MinimalMode {
+		s.logger.Info("Registered server-scoped MCP endpoints",
+			zap.Strings("endpoints", []string{"/mcp/servers/{server_id}", "/mcp/controller/{server_id}"}))
+	}
 
 	// API v1 endpoints with chi router for REST API and SSE.
 	// MCP-32: pass the observability manager so /metrics is served (and HTTP
@@ -2130,64 +2202,66 @@ func (s *Server) startCustomHTTPServer(ctx context.Context, streamableServer *se
 	// Debug / profiling endpoints (API-key gated). Block & mutex profiles
 	// default to off; we enable them when the route is hit so the running
 	// daemon stays zero-overhead until someone actively profiles.
-	pprofMux := http.NewServeMux()
-	pprofMux.HandleFunc("/debug/pprof/", httppprof.Index)
-	pprofMux.HandleFunc("/debug/pprof/cmdline", httppprof.Cmdline)
-	pprofMux.HandleFunc("/debug/pprof/profile", httppprof.Profile)
-	pprofMux.HandleFunc("/debug/pprof/symbol", httppprof.Symbol)
-	pprofMux.HandleFunc("/debug/pprof/trace", httppprof.Trace)
-	pprofGated := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cfg := s.runtime.Config()
-		if cfg == nil || cfg.APIKey == "" {
-			http.Error(w, "api key not configured", http.StatusUnauthorized)
-			return
-		}
-		token := r.Header.Get("X-API-Key")
-		if token == "" {
-			token = r.URL.Query().Get("apikey")
-		}
-		if token == "" {
-			if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-				token = strings.TrimPrefix(h, "Bearer ")
+	if !cfg.MinimalMode {
+		pprofMux := http.NewServeMux()
+		pprofMux.HandleFunc("/debug/pprof/", httppprof.Index)
+		pprofMux.HandleFunc("/debug/pprof/cmdline", httppprof.Cmdline)
+		pprofMux.HandleFunc("/debug/pprof/profile", httppprof.Profile)
+		pprofMux.HandleFunc("/debug/pprof/symbol", httppprof.Symbol)
+		pprofMux.HandleFunc("/debug/pprof/trace", httppprof.Trace)
+		pprofGated := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			cfg := s.runtime.Config()
+			if cfg == nil || cfg.APIKey == "" {
+				http.Error(w, "api key not configured", http.StatusUnauthorized)
+				return
 			}
-		}
-		if token != cfg.APIKey {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		gruntime.SetBlockProfileRate(100_000_000) // 1 sample / 100 ms blocked
-		gruntime.SetMutexProfileFraction(100)     // sample 1% of contention
-		pprofMux.ServeHTTP(w, r)
-	})
-	mux.Handle("/debug/pprof/", pprofGated)
-	s.logger.Info("Registered pprof endpoints", zap.String("path", "/debug/pprof/"))
+			token := r.Header.Get("X-API-Key")
+			if token == "" {
+				token = r.URL.Query().Get("apikey")
+			}
+			if token == "" {
+				if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+					token = strings.TrimPrefix(h, "Bearer ")
+				}
+			}
+			if token != cfg.APIKey {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			gruntime.SetBlockProfileRate(100_000_000)
+			gruntime.SetMutexProfileFraction(100)
+			pprofMux.ServeHTTP(w, r)
+		})
+		mux.Handle("/debug/pprof/", pprofGated)
 
-	// Swagger UI (OpenAPI documentation) - mounted directly on main mux for /swagger/* access
-	swaggerHandler := httpapi.SetupSwaggerHandler(s.logger.Sugar())
-	mux.Handle("/swagger/", swaggerHandler)
-	s.logger.Info("Registered Swagger UI endpoint", zap.String("swagger_endpoint", "/swagger/*"))
+		// Swagger UI (OpenAPI documentation) and the embedded browser UI are not
+		// part of the controller MVP surface.
+		swaggerHandler := httpapi.SetupSwaggerHandler(s.logger.Sugar())
+		mux.Handle("/swagger/", swaggerHandler)
 
-	// Web UI endpoints (serves embedded Vue.js frontend) with selective API key protection.
-	// Spec 080 (FR-006): every serve of the UI entrypoint (index document)
-	// increments the persistent web_ui_opened funnel counter — independent of
-	// the X-MCPProxy-Client-header surface_requests.webui counting. nil-safe
-	// at both layers: no telemetry service or no funnel store → no-op.
-	webUIHandler := web.NewHandlerWithIndexCallback(s.logger.Sugar(), func() {
-		if ts := s.runtime.TelemetryService(); ts != nil {
-			ts.RecordWebUIOpen()
-		}
-	})
-	selectiveProtectedWebUIHandler := s.createSelectiveWebUIProtectedHandler(http.StripPrefix("/ui", webUIHandler))
-	mux.Handle("/ui/", selectiveProtectedWebUIHandler)
-	// Redirect root to web UI
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" {
-			http.Redirect(w, r, "/ui/", http.StatusFound)
-		} else {
-			http.NotFound(w, r)
-		}
-	})
-	s.logger.Info("Registered Web UI endpoints", zap.Strings("ui_endpoints", []string{"/ui/", "/"}))
+		// Web UI endpoints (serves embedded Vue.js frontend) with selective API key protection.
+		// Spec 080 (FR-006): every serve of the UI entrypoint (index document)
+		// increments the persistent web_ui_opened funnel counter — independent of
+		// the X-MCPProxy-Client-header surface_requests.webui counting. nil-safe
+		// at both layers: no telemetry service or no funnel store → no-op.
+		webUIHandler := web.NewHandlerWithIndexCallback(s.logger.Sugar(), func() {
+			if ts := s.runtime.TelemetryService(); ts != nil {
+				ts.RecordWebUIOpen()
+			}
+		})
+		selectiveProtectedWebUIHandler := s.createSelectiveWebUIProtectedHandler(http.StripPrefix("/ui", webUIHandler))
+		mux.Handle("/ui/", selectiveProtectedWebUIHandler)
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/" {
+				http.Redirect(w, r, "/ui/", http.StatusFound)
+			} else {
+				http.NotFound(w, r)
+			}
+		})
+		s.logger.Info("Registered Web UI endpoints", zap.Strings("ui_endpoints", []string{"/ui/", "/"}))
+	} else {
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
+	}
 
 	// Determine actual TCP address for logging
 	var actualAddr, displayAddr string
@@ -2521,6 +2595,35 @@ func (s *Server) GetTokenSavings() (*contracts.ServerTokenMetrics, error) {
 // GetServerTools returns tools for a specific server
 func (s *Server) GetServerTools(serverName string) ([]map[string]interface{}, error) {
 	s.logger.Debug("GetServerTools called (Phase 7.1: using StateView)", zap.String("server", serverName))
+	if cfg, _ := s.GetConfig(); cfg != nil && cfg.MinimalMode && s.mcpProxy != nil {
+		discovered, err := s.mcpProxy.upstreamManager.DiscoverTools(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		result := make([]map[string]interface{}, 0)
+		for _, tool := range discovered {
+			if tool == nil || tool.ServerName != serverName {
+				continue
+			}
+			value := map[string]interface{}{}
+			if tool.RawToolJSON != "" {
+				_ = json.Unmarshal([]byte(tool.RawToolJSON), &value)
+			}
+			value["name"] = tool.Name
+			value["server_name"] = serverName
+			if _, ok := value["description"]; !ok {
+				value["description"] = tool.Description
+			}
+			if _, ok := value["inputSchema"]; !ok && tool.ParamsJSON != "" {
+				var schema interface{}
+				if json.Unmarshal([]byte(tool.ParamsJSON), &schema) == nil {
+					value["inputSchema"] = schema
+				}
+			}
+			result = append(result, value)
+		}
+		return result, nil
+	}
 
 	// Phase 7.1: Use StateView for lock-free cached tool reads
 	supervisor := s.runtime.Supervisor()

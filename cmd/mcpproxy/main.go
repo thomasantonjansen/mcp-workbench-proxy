@@ -97,8 +97,8 @@ func main() {
 	config.SetRegistriesInitCallback(registries.SetRegistriesFromConfig)
 
 	rootCmd := &cobra.Command{
-		Use:     "mcpproxy",
-		Short:   "Smart MCP Proxy - Intelligent tool discovery and proxying for Model Context Protocol servers",
+		Use:     "unity-mcp-proxy",
+		Short:   "Transparent local MCP proxy managed by Unity MCP Controller",
 		Version: version,
 	}
 	rootCmd.SetVersionTemplate(versionLine())
@@ -137,84 +137,11 @@ func main() {
 	serverCmd.Flags().BoolVar(&allowServerRemove, "allow-server-remove", true, "Allow removing existing servers")
 	serverCmd.Flags().BoolVar(&enablePrompts, "enable-prompts", true, "Enable prompts for user input")
 
-	// Add search-servers command
-	searchCmd := createSearchServersCommand()
-
-	// Add tools command
-	toolsCmd := GetToolsCommand()
-
-	// Add call command
-	callCmd := GetCallCommand()
-
-	// Add code command
-	codeCmd := GetCodeCommand()
-
-	// Add auth command
-	authCmd := GetAuthCommand()
-
-	// Add secrets command
-	secretsCmd := GetSecretsCommand()
-
-	// Add trust-cert command
-	trustCertCmd := GetTrustCertCommand()
-
-	// Add upstream command
-	upstreamCmd := GetUpstreamCommand()
-
-	// Add doctor command
-	doctorCmd := GetDoctorCommand()
-
-	// Add activity command
-	activityCmd := GetActivityCommand()
-
-	// Add TUI command
-	tuiCmd := GetTUICommand()
-
-	// Add status command
-	statusCmd := GetStatusCommand()
-
-	// Add token command (Spec 028: Agent tokens)
-	tokenCmd := GetTokenCommand()
-
-	// Add telemetry command (Spec 036)
-	telemetryCmd := GetTelemetryCommand()
-
-	// Add feedback command (Spec 036)
-	feedbackCmd := GetFeedbackCommand()
-
-	// Add security command (Spec 039: Security scanner plugins)
-	securityCmd := GetSecurityCommand()
-
-	// Add connect/disconnect commands
-	connectCmd := GetConnectCommand()
-	disconnectCmd := GetDisconnectCommand()
-
-	// Add commands to root
+	// This fork exposes only the app-owned server lifecycle. Marketplace,
+	// search, code execution, TUI and client mutation commands are deliberately
+	// absent from the executable's public surface.
 	rootCmd.AddCommand(serverCmd)
-	rootCmd.AddCommand(newSandboxExecCommand())
-	rootCmd.AddCommand(searchCmd)
-	rootCmd.AddCommand(GetRegistryCommand())
-	rootCmd.AddCommand(toolsCmd)
-	rootCmd.AddCommand(callCmd)
-	rootCmd.AddCommand(codeCmd)
-	rootCmd.AddCommand(authCmd)
-	rootCmd.AddCommand(secretsCmd)
-	rootCmd.AddCommand(trustCertCmd)
-	rootCmd.AddCommand(upstreamCmd)
-	rootCmd.AddCommand(doctorCmd)
-	rootCmd.AddCommand(activityCmd)
-	rootCmd.AddCommand(tuiCmd)
-	rootCmd.AddCommand(statusCmd)
-	rootCmd.AddCommand(tokenCmd)
-	rootCmd.AddCommand(telemetryCmd)
-	rootCmd.AddCommand(feedbackCmd)
-	rootCmd.AddCommand(securityCmd)
-	rootCmd.AddCommand(connectCmd)
-	rootCmd.AddCommand(disconnectCmd)
 	rootCmd.AddCommand(GetVersionCommand())
-
-	// Server-edition-only commands (e.g. `credential`). No-op in personal edition.
-	registerServerEditionCommands(rootCmd)
 
 	// Setup --help-json for machine-readable help discovery
 	// This must be called AFTER all commands are added
@@ -626,7 +553,7 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	// Spec 042: print the one-time first-run telemetry notice on stderr (if
 	// the user has not already seen it). Persist the flag so we never nag
 	// twice.
-	if telemetry.MaybePrintFirstRunNotice(cfg, os.Stderr) {
+	if !cfg.MinimalMode && telemetry.MaybePrintFirstRunNotice(cfg, os.Stderr) {
 		_ = config.SaveConfig(cfg, actualConfigPath)
 	}
 
@@ -642,10 +569,17 @@ func runServer(cmd *cobra.Command, _ []string) error {
 
 	// Setup signal handling for graceful shutdown with force quit on second signal
 	logger.Info("Signal handler goroutine starting - waiting for SIGINT or SIGTERM")
-	_ = logger.Sync()
+	// Syncing a console logger backed by a Windows process pipe can block before
+	// the HTTP listener starts. The controller owns and captures this process, so
+	// minimal mode must never gate readiness on FlushFileBuffers for stdout.
+	if !cfg.MinimalMode {
+		_ = logger.Sync()
+	}
 	go func() {
 		logger.Info("Signal handler goroutine is running, waiting for signal on channel")
-		_ = logger.Sync()
+		if !cfg.MinimalMode {
+			_ = logger.Sync()
+		}
 		sig := <-sigChan
 		receivedSignal.Store(sig.String()) // Spec 024: Store signal for activity logging
 		logger.Info("Received signal, shutting down", zap.String("signal", sig.String()))

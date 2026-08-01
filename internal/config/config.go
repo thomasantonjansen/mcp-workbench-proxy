@@ -153,7 +153,11 @@ func (c *Config) ResolveToonOutput(sc *ServerConfig) string {
 
 // Config represents the main configuration structure
 type Config struct {
-	Listen       string `json:"listen" mapstructure:"listen"`
+	Version int    `json:"version,omitempty" mapstructure:"version"`
+	Listen  string `json:"listen" mapstructure:"listen"`
+	// MinimalMode removes the bundled browser UI and documentation surfaces.
+	// It is used by the Unity MCP Controller embedded proxy executable.
+	MinimalMode  bool   `json:"minimal_mode,omitempty" mapstructure:"minimal-mode"`
 	TrayEndpoint string `json:"tray_endpoint,omitempty" mapstructure:"tray-endpoint"` // Tray endpoint override (unix:// or npipe://)
 	EnableSocket bool   `json:"enable_socket" mapstructure:"enable-socket"`           // Enable Unix socket/named pipe for local IPC (default: true)
 	DataDir      string `json:"data_dir" mapstructure:"data-dir"`
@@ -423,6 +427,11 @@ type TokenizerConfig struct {
 
 // LogConfig represents logging configuration
 type LogConfig struct {
+	// Enabled controls the local, append-only JSONL log of transparently
+	// forwarded MCP tool calls. It is intentionally separate from the process
+	// logger switches below.
+	Enabled       bool   `json:"enabled,omitempty" mapstructure:"enabled"`
+	CallsFilename string `json:"calls_filename,omitempty" mapstructure:"calls-filename"`
 	Level         string `json:"level" mapstructure:"level"`
 	EnableFile    bool   `json:"enable_file" mapstructure:"enable-file"`
 	EnableConsole bool   `json:"enable_console" mapstructure:"enable-console"`
@@ -437,6 +446,7 @@ type LogConfig struct {
 
 // ServerConfig represents upstream MCP server configuration
 type ServerConfig struct {
+	ID          string            `json:"id,omitempty" mapstructure:"id"`
 	Name        string            `json:"name,omitempty" mapstructure:"name"`
 	URL         string            `json:"url,omitempty" mapstructure:"url"`
 	Protocol    string            `json:"protocol,omitempty" mapstructure:"protocol"` // stdio, http, sse, streamable-http, auto
@@ -494,6 +504,9 @@ type ServerConfig struct {
 	// this for upstreams that do legitimate first-run warmup (e.g. caching many
 	// channels/users) before responding to `initialize`.
 	InitTimeout *Duration `json:"init_timeout,omitempty" mapstructure:"init_timeout" swaggertype:"string"`
+	// CallToolTimeout overrides the proxy-wide tool call deadline for this
+	// upstream while preserving imported client-specific timeout settings.
+	CallToolTimeout *Duration `json:"call_tool_timeout,omitempty" mapstructure:"call_tool_timeout" swaggertype:"string"`
 
 	// ToonOutput overrides the global toon_output mode for this server's
 	// tools (spec 084, FR-001). Plain string, not a pointer: ""/absent =
@@ -503,6 +516,11 @@ type ServerConfig struct {
 
 	EnabledTools  []string `json:"enabled_tools,omitempty" mapstructure:"enabled_tools"`   // Allowlist: only these tools are exposed; mutually exclusive with disabled_tools
 	DisabledTools []string `json:"disabled_tools,omitempty" mapstructure:"disabled_tools"` // Denylist: these tools are hidden; mutually exclusive with enabled_tools
+	// AgentHiddenTools only affects the public agent endpoint. The controller
+	// endpoint and controller-owned actions/workflows may still call these tools.
+	AgentHiddenTools    []string                   `json:"agent_hidden_tools,omitempty" mapstructure:"agent_hidden_tools"`
+	Publications        []PublishedToolConfig      `json:"publications,omitempty" mapstructure:"publications"`
+	PublicationCallback *PublicationCallbackConfig `json:"publication_callback,omitempty" mapstructure:"publication_callback"`
 
 	// SourceRegistryID records which registry this server was added from (empty
 	// for manually-configured servers). MCP-866: surfaced in the approval /
@@ -521,6 +539,30 @@ type ServerConfig struct {
 	// server edition, an empty stub in the personal edition (which ignores it),
 	// so personal-edition behavior is unaffected. swaggerignore mirrors ServerEdition.
 	AuthBroker *AuthBrokerConfig `json:"auth_broker,omitempty" mapstructure:"auth_broker" swaggerignore:"true"`
+}
+
+// PublishedToolConfig is a controller-owned virtual MCP tool. Tool contains
+// the complete MCP tool descriptor and is preserved when it is exposed.
+type PublishedToolConfig struct {
+	PublicationID string          `json:"publication_id" mapstructure:"publication_id"`
+	Name          string          `json:"name" mapstructure:"name"`
+	Kind          string          `json:"kind" mapstructure:"kind"`
+	Tool          json.RawMessage `json:"tool" mapstructure:"tool"`
+}
+
+type PublicationCallbackConfig struct {
+	URL   string `json:"url" mapstructure:"url"`
+	Token string `json:"token" mapstructure:"token"`
+}
+
+func (s *ServerConfig) StableID() string {
+	if s == nil || strings.TrimSpace(s.ID) == "" {
+		if s == nil {
+			return ""
+		}
+		return s.Name
+	}
+	return s.ID
 }
 
 // OAuthConfig represents OAuth configuration for a server
@@ -1098,15 +1140,19 @@ func ConvertFromCursorFormat(cursorConfig *CursorMCPConfig) []*ServerConfig {
 
 // ToolMetadata represents tool information stored in the index
 type ToolMetadata struct {
-	Name             string           `json:"name"`
-	ServerName       string           `json:"server_name"`
-	Description      string           `json:"description"`
-	ParamsJSON       string           `json:"params_json"`
-	OutputSchemaJSON string           `json:"output_schema_json,omitempty"` // declared output schema, raw JSON bytes (Spec 056)
-	Hash             string           `json:"hash"`
-	Created          time.Time        `json:"created"`
-	Updated          time.Time        `json:"updated"`
-	Annotations      *ToolAnnotations `json:"annotations,omitempty"`
+	Name             string `json:"name"`
+	ServerName       string `json:"server_name"`
+	Description      string `json:"description"`
+	ParamsJSON       string `json:"params_json"`
+	OutputSchemaJSON string `json:"output_schema_json,omitempty"` // declared output schema, raw JSON bytes (Spec 056)
+	// RawToolJSON is the complete MCP tool descriptor returned by the upstream
+	// SDK. Direct mode uses it so schemas, metadata and annotations are not
+	// reconstructed or dropped while only the public name is changed.
+	RawToolJSON string           `json:"raw_tool_json,omitempty"`
+	Hash        string           `json:"hash"`
+	Created     time.Time        `json:"created"`
+	Updated     time.Time        `json:"updated"`
+	Annotations *ToolAnnotations `json:"annotations,omitempty"`
 }
 
 // ToolAnnotations represents MCP tool behavior hints
@@ -1791,6 +1837,7 @@ func (c *Config) ValidateDetailed() []ValidationError {
 
 	// Validate server configurations
 	serverNames := make(map[string]bool)
+	serverIDs := make(map[string]bool)
 	for i, server := range c.Servers {
 		fieldPrefix := fmt.Sprintf("mcpServers[%d]", i)
 
@@ -1815,6 +1862,26 @@ func (c *Config) ValidateDetailed() []ValidationError {
 			})
 		} else {
 			serverNames[server.Name] = true
+		}
+		if c.MinimalMode {
+			// Empty IDs are accepted only for the one-time controller upgrade from
+			// the v1 config. Scoped routing falls back to the immutable server name
+			// until the Python migration persists a UUID.
+			if server.ID != "" && serverIDs[server.ID] {
+				errors = append(errors, ValidationError{Field: fieldPrefix + ".id", Message: fmt.Sprintf("duplicate server id: %s", server.ID)})
+			} else if server.ID != "" {
+				serverIDs[server.ID] = true
+			}
+			seenPublic := map[string]bool{}
+			for publicationIndex, publication := range server.Publications {
+				publicationField := fmt.Sprintf("%s.publications[%d]", fieldPrefix, publicationIndex)
+				if publication.PublicationID == "" || publication.Name == "" || len(publication.Tool) == 0 {
+					errors = append(errors, ValidationError{Field: publicationField, Message: "publication_id, name and tool are required"})
+				} else if seenPublic[publication.Name] {
+					errors = append(errors, ValidationError{Field: publicationField + ".name", Message: fmt.Sprintf("duplicate published tool name: %s", publication.Name)})
+				}
+				seenPublic[publication.Name] = true
+			}
 		}
 
 		// Validate protocol

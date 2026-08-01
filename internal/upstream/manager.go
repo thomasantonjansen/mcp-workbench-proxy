@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"os/exec"
@@ -10,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/mark3labs/mcp-go/mcp"
 
 	"go.uber.org/zap"
 
@@ -1246,6 +1249,10 @@ func (m *Manager) CallTool(ctx context.Context, toolName string, args map[string
 		zap.Error(err),
 		zap.Bool("has_result", result != nil))
 	if err != nil {
+		var protocolErr *mcp.JSONRPCErrorDetailsError
+		if errors.As(err, &protocolErr) {
+			return nil, protocolErr
+		}
 		// Enrich errors at source with server context
 		errStr := err.Error()
 

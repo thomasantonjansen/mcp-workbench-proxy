@@ -1,3 +1,11 @@
+> [!IMPORTANT]
+> This is the public, auditable proxy runtime used by **MCP Workbench**. It is
+> maintained as a fork of `smart-mcp-proxy/mcpproxy-go` and retains the
+> upstream history and MIT license. The supported product build is the Windows
+> x64 `cmd/mcpproxy` daemon in `minimal_mode`; private workflow and analysis
+> code is not part of this repository. See
+> [PRODUCT_ARCHITECTURE.md](PRODUCT_ARCHITECTURE.md).
+
 <p align="center">
   <a href="https://mcpproxy.app" target="_blank" rel="noopener">
     <img src="docs/social.png" alt="MCPProxy — Supercharge AI Agents, Safely · One safe endpoint in front of every MCP server" width="100%" />

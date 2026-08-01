@@ -11,6 +11,15 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/profile"
 )
 
+type protocolSessionIDContextKey struct{}
+
+func withProtocolSessionID(ctx context.Context, sessionID string) context.Context {
+	if sessionID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, protocolSessionIDContextKey{}, sessionID)
+}
+
 // sessionIDFromContext returns the stable mcp-go per-session id available at
 // tool-call time, or "" when no session is bound to the request. This is the
 // id confirmed (Profiles v2 T2 first subtask) to be exposed by mcp-go via
@@ -19,6 +28,9 @@ import (
 func sessionIDFromContext(ctx context.Context) string {
 	if sess := mcpserver.ClientSessionFromContext(ctx); sess != nil {
 		return sess.SessionID()
+	}
+	if sessionID, _ := ctx.Value(protocolSessionIDContextKey{}).(string); sessionID != "" {
+		return sessionID
 	}
 	return ""
 }

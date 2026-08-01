@@ -1,5 +1,7 @@
 module github.com/smart-mcp-proxy/mcpproxy-go
 
+replace github.com/mark3labs/mcp-go => ./third_party/mcp-go
+
 go 1.25.5
 
 require (

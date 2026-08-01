@@ -145,9 +145,11 @@ type MCPProxyServer struct {
 
 	// Routing mode MCP server instances (Spec 031)
 	// Each instance has different tools registered for its routing mode.
-	directServer   *mcpserver.MCPServer // Direct mode: upstream tools with serverName__toolName naming
-	codeExecServer *mcpserver.MCPServer // Code execution mode: code_execution + retrieve_tools
-	callToolServer *mcpserver.MCPServer // Call tool mode: retrieve_tools + call_tool_read/write/destructive
+	directServer    *mcpserver.MCPServer // Direct mode: upstream tools with serverName__toolName naming
+	codeExecServer  *mcpserver.MCPServer // Code execution mode: code_execution + retrieve_tools
+	callToolServer  *mcpserver.MCPServer // Call tool mode: retrieve_tools + call_tool_read/write/destructive
+	scopedServersMu sync.RWMutex
+	scopedServers   map[string]*scopedMCPServers
 
 	// Docker availability cache
 	dockerAvailableCache *bool
@@ -169,6 +171,12 @@ type MCPProxyServer struct {
 	// tokens; execution-time authorization remains authoritative.
 	directToolPermsMu sync.RWMutex
 	directToolPerms   map[string]string
+	// directToolRoutes is the authoritative routing table for the public
+	// server__tool surface. Handlers are registered from this table; public
+	// names are never parsed to determine an upstream destination.
+	directToolRoutesMu sync.RWMutex
+	directToolRoutes   map[string]directToolRoute
+	callLogMu          sync.Mutex
 
 	// Spec 049: in-memory only counter of retrieve_tools calls that opted into
 	// include_disabled. Never persisted (privacy, consistent with Spec 042).
@@ -410,7 +418,9 @@ func NewMCPProxyServer(
 	// the default 50k chars up to the declared value (max 500k), so large
 	// upstream tool responses flow through inline instead of being spilled
 	// to disk as a 2KB preview. No-op when config is 0.
-	registerMaxResultSizeHook(hooks, config.MaxResultSizeChars)
+	if !config.MinimalMode {
+		registerMaxResultSizeHook(hooks, config.MaxResultSizeChars)
+	}
 
 	// Create MCP server with capabilities and hooks
 	capabilities := []mcpserver.ServerOption{
