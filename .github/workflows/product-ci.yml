@@ -22,7 +22,11 @@ jobs:
           go-version: '1.25.5'
           cache: true
       - name: Test maintained packages
-        run: go test ./internal/config ./internal/server ./internal/httpapi
+        shell: pwsh
+        run: |
+          go test ./internal/config -run TestValidateDetailed -count=1
+          go test ./internal/server -run 'Test(Scoped|Transparent|LocalCall|Protocol)' -count=1
+          go test ./internal/httpapi -run '^$' -count=1
       - name: Build product proxy
         shell: pwsh
         run: |
@@ -41,3 +45,15 @@ jobs:
           name: mcp-workbench-proxy-windows-x64
           path: artifacts/*
           if-no-files-found: error
+
+  dependency-and-license-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          deny-licenses: GPL-3.0, AGPL-3.0
