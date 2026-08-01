@@ -1,0 +1,69 @@
+name: MCP Workbench Proxy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.12'
+          cache: true
+      - name: Test maintained packages
+        shell: pwsh
+        run: |
+          go test ./internal/config -run TestValidateDetailed -count=1
+          go test ./internal/server -run 'Test(Scoped|Transparent|LocalCall|Protocol)' -count=1
+          go test ./internal/httpapi -run '^$' -count=1
+      - name: Build product proxy
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          go build -trimpath -ldflags "-s -w -X main.version=${{ github.ref_name }}" -o artifacts/mcp-workbench-proxy-windows-x64.exe ./cmd/mcpproxy
+          (Get-FileHash artifacts/mcp-workbench-proxy-windows-x64.exe -Algorithm SHA256).Hash.ToLower() | Set-Content artifacts/mcp-workbench-proxy-windows-x64.exe.sha256
+          go list -m -json all | Set-Content artifacts/go-modules.json
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          file: artifacts/mcp-workbench-proxy-windows-x64.exe
+          output-file: artifacts/mcp-workbench-proxy-windows-x64.spdx.json
+          format: spdx-json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcp-workbench-proxy-windows-x64
+          path: artifacts/*
+          if-no-files-found: error
+
+  dependency-and-license-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.12'
+          cache: true
+      - name: Dependency vulnerability scan
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./cmd/mcpproxy
+      - name: License scan
+        run: |
+          go install github.com/google/go-licenses@v1.6.0
+          go-licenses csv ./cmd/mcpproxy > licenses.csv
+          if grep -E ',(GPL-3.0|AGPL-3.0)$' licenses.csv; then
+            echo "Denied copyleft license found"
+            exit 1
+          fi

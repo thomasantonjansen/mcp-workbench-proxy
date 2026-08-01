@@ -204,7 +204,7 @@ func TestActivityList_SensitiveDataFilter(t *testing.T) {
 		assert.Equal(t, http.StatusOK, w.Code)
 
 		var resp struct {
-			Success bool                         `json:"success"`
+			Success bool                           `json:"success"`
 			Data    contracts.ActivityListResponse `json:"data"`
 		}
 		err := json.NewDecoder(w.Body).Decode(&resp)
@@ -231,7 +231,7 @@ func TestActivityList_SensitiveDataFilter(t *testing.T) {
 		assert.Equal(t, http.StatusOK, w.Code)
 
 		var resp struct {
-			Success bool                         `json:"success"`
+			Success bool                           `json:"success"`
 			Data    contracts.ActivityListResponse `json:"data"`
 		}
 		err := json.NewDecoder(w.Body).Decode(&resp)
@@ -268,7 +268,7 @@ func TestActivityList_DetectionTypeFilter(t *testing.T) {
 		assert.Equal(t, http.StatusOK, w.Code)
 
 		var resp struct {
-			Success bool                         `json:"success"`
+			Success bool                           `json:"success"`
 			Data    contracts.ActivityListResponse `json:"data"`
 		}
 		err := json.NewDecoder(w.Body).Decode(&resp)
@@ -342,7 +342,7 @@ func TestActivityList_SeverityFilter(t *testing.T) {
 		assert.Equal(t, http.StatusOK, w.Code)
 
 		var resp struct {
-			Success bool                         `json:"success"`
+			Success bool                           `json:"success"`
 			Data    contracts.ActivityListResponse `json:"data"`
 		}
 		err := json.NewDecoder(w.Body).Decode(&resp)
@@ -618,7 +618,7 @@ func TestActivityResponse_SensitiveDataFields(t *testing.T) {
 			"activity-2-credit-card": "high",
 			"activity-3-multiple":    "critical", // Has both critical and high, critical is max
 			"activity-4-medium":      "medium",
-			"activity-5-clean":       "",         // No sensitive data
+			"activity-5-clean":       "", // No sensitive data
 		}
 
 		for _, activity := range resp.Data.Activities {
@@ -680,7 +680,7 @@ func TestActivityDetail_SensitiveDataFields(t *testing.T) {
 		assert.Equal(t, http.StatusOK, w.Code)
 
 		var resp struct {
-			Success bool                          `json:"success"`
+			Success bool                             `json:"success"`
 			Data    contracts.ActivityDetailResponse `json:"data"`
 		}
 		err := json.NewDecoder(w.Body).Decode(&resp)
@@ -703,7 +703,7 @@ func TestActivityDetail_SensitiveDataFields(t *testing.T) {
 		assert.Equal(t, http.StatusOK, w.Code)
 
 		var resp struct {
-			Success bool                          `json:"success"`
+			Success bool                             `json:"success"`
 			Data    contracts.ActivityDetailResponse `json:"data"`
 		}
 		err := json.NewDecoder(w.Body).Decode(&resp)

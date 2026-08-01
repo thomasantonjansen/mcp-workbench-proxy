@@ -152,39 +152,39 @@ func TestMCPProxyServer_validateIntentForVariant(t *testing.T) {
 	}
 
 	tests := []struct {
-		name           string
-		intent         *contracts.IntentDeclaration
-		toolVariant    string
-		wantErr        bool
-		wantOpType     string // expected operation_type after inference
+		name        string
+		intent      *contracts.IntentDeclaration
+		toolVariant string
+		wantErr     bool
+		wantOpType  string // expected operation_type after inference
 	}{
 		{
-			name:           "nil intent - creates default with inferred operation_type",
-			intent:         nil,
-			toolVariant:    contracts.ToolVariantRead,
-			wantErr:        false,
-			wantOpType:     contracts.OperationTypeRead,
+			name:        "nil intent - creates default with inferred operation_type",
+			intent:      nil,
+			toolVariant: contracts.ToolVariantRead,
+			wantErr:     false,
+			wantOpType:  contracts.OperationTypeRead,
 		},
 		{
-			name:           "empty intent - infers operation_type from read variant",
-			intent:         &contracts.IntentDeclaration{},
-			toolVariant:    contracts.ToolVariantRead,
-			wantErr:        false,
-			wantOpType:     contracts.OperationTypeRead,
+			name:        "empty intent - infers operation_type from read variant",
+			intent:      &contracts.IntentDeclaration{},
+			toolVariant: contracts.ToolVariantRead,
+			wantErr:     false,
+			wantOpType:  contracts.OperationTypeRead,
 		},
 		{
-			name:           "empty intent - infers operation_type from write variant",
-			intent:         &contracts.IntentDeclaration{},
-			toolVariant:    contracts.ToolVariantWrite,
-			wantErr:        false,
-			wantOpType:     contracts.OperationTypeWrite,
+			name:        "empty intent - infers operation_type from write variant",
+			intent:      &contracts.IntentDeclaration{},
+			toolVariant: contracts.ToolVariantWrite,
+			wantErr:     false,
+			wantOpType:  contracts.OperationTypeWrite,
 		},
 		{
-			name:           "empty intent - infers operation_type from destructive variant",
-			intent:         &contracts.IntentDeclaration{},
-			toolVariant:    contracts.ToolVariantDestructive,
-			wantErr:        false,
-			wantOpType:     contracts.OperationTypeDestructive,
+			name:        "empty intent - infers operation_type from destructive variant",
+			intent:      &contracts.IntentDeclaration{},
+			toolVariant: contracts.ToolVariantDestructive,
+			wantErr:     false,
+			wantOpType:  contracts.OperationTypeDestructive,
 		},
 		{
 			name: "intent with optional fields - operation_type inferred",

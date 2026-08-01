@@ -15,7 +15,6 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/auth"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
-	"github.com/smart-mcp-proxy/mcpproxy-go/internal/reqcontext"
 )
 
 const (
@@ -62,6 +61,49 @@ func FormatDirectToolName(serverName, toolName string) string {
 	return serverName + DirectModeToolSeparator + toolName
 }
 
+type directToolRoute struct {
+	ServerName   string
+	OriginalName string
+}
+
+func buildTransparentDirectTool(tool *config.ToolMetadata, directName string) mcp.Tool {
+	var mcpTool mcp.Tool
+	if tool.RawToolJSON != "" {
+		var raw struct {
+			InputSchema  json.RawMessage `json:"inputSchema"`
+			OutputSchema json.RawMessage `json:"outputSchema"`
+		}
+		if json.Unmarshal([]byte(tool.RawToolJSON), &mcpTool) == nil &&
+			json.Unmarshal([]byte(tool.RawToolJSON), &raw) == nil {
+			if len(raw.InputSchema) > 0 {
+				mcpTool.InputSchema = mcp.ToolInputSchema{}
+				mcpTool.RawInputSchema = append(json.RawMessage(nil), raw.InputSchema...)
+			}
+			if len(raw.OutputSchema) > 0 {
+				mcpTool.OutputSchema = mcp.ToolOutputSchema{}
+				mcpTool.RawOutputSchema = append(json.RawMessage(nil), raw.OutputSchema...)
+			}
+		}
+	}
+	if mcpTool.Name == "" {
+		// Compatibility fallback for indexes created before RawToolJSON existed.
+		mcpTool = mcp.NewTool(tool.Name, mcp.WithDescription(tool.Description))
+		if tool.ParamsJSON != "" {
+			mcpTool.InputSchema = mcp.ToolInputSchema{}
+			mcpTool.RawInputSchema = json.RawMessage(tool.ParamsJSON)
+		}
+		applyToolOutputSchemaJSON(&mcpTool, tool.OutputSchemaJSON)
+	}
+	mcpTool.Name = directName
+	return mcpTool
+}
+
+func (p *MCPProxyServer) setDirectToolRoutes(routes map[string]directToolRoute) {
+	p.directToolRoutesMu.Lock()
+	defer p.directToolRoutesMu.Unlock()
+	p.directToolRoutes = routes
+}
+
 // buildDirectModeTools builds MCP tool definitions for direct mode.
 // Each upstream tool is exposed directly with serverName__toolName naming.
 // Only tools from connected, enabled, non-quarantined servers are included.
@@ -78,61 +120,24 @@ func (p *MCPProxyServer) buildDirectModeTools() []mcpserver.ServerTool {
 
 	serverTools := make([]mcpserver.ServerTool, 0, len(tools))
 	directToolPerms := make(map[string]string, len(tools))
+	directToolRoutes := make(map[string]directToolRoute, len(tools))
 	for _, tool := range tools {
 		directName := FormatDirectToolName(tool.ServerName, tool.Name)
+		if previous, exists := directToolRoutes[directName]; exists {
+			p.setDirectToolPermissions(nil)
+			p.setDirectToolRoutes(nil)
+			p.logger.Error("duplicate public tool name in direct mode",
+				zap.String("public_tool", directName),
+				zap.String("first_server", previous.ServerName),
+				zap.String("second_server", tool.ServerName))
+			return nil
+		}
+		directToolRoutes[directName] = directToolRoute{
+			ServerName: tool.ServerName, OriginalName: tool.Name,
+		}
 		directToolPerms[directName] = requiredPermissionForDirectTool(tool.Annotations)
 
-		// Build MCP tool options
-		opts := []mcp.ToolOption{
-			mcp.WithDescription(fmt.Sprintf("[%s] %s", tool.ServerName, tool.Description)),
-		}
-
-		// Apply annotations from upstream tool
-		if tool.Annotations != nil {
-			if tool.Annotations.Title != "" {
-				opts = append(opts, mcp.WithTitleAnnotation(tool.Annotations.Title))
-			}
-			if tool.Annotations.ReadOnlyHint != nil {
-				opts = append(opts, mcp.WithReadOnlyHintAnnotation(*tool.Annotations.ReadOnlyHint))
-			}
-			if tool.Annotations.DestructiveHint != nil {
-				opts = append(opts, mcp.WithDestructiveHintAnnotation(*tool.Annotations.DestructiveHint))
-			}
-			if tool.Annotations.IdempotentHint != nil {
-				opts = append(opts, mcp.WithIdempotentHintAnnotation(*tool.Annotations.IdempotentHint))
-			}
-			if tool.Annotations.OpenWorldHint != nil {
-				opts = append(opts, mcp.WithOpenWorldHintAnnotation(*tool.Annotations.OpenWorldHint))
-			}
-		}
-
-		mcpTool := mcp.NewTool(directName, opts...)
-
-		// Apply input schema from upstream tool
-		if tool.ParamsJSON != "" {
-			var schema map[string]interface{}
-			if err := json.Unmarshal([]byte(tool.ParamsJSON), &schema); err == nil {
-				mcpTool.InputSchema = mcp.ToolInputSchema{
-					Type: "object",
-				}
-				if props, ok := schema["properties"].(map[string]interface{}); ok {
-					mcpTool.InputSchema.Properties = props
-				}
-				if req, ok := schema["required"].([]interface{}); ok {
-					reqStrings := make([]string, 0, len(req))
-					for _, r := range req {
-						if s, ok := r.(string); ok {
-							reqStrings = append(reqStrings, s)
-						}
-					}
-					mcpTool.InputSchema.Required = reqStrings
-				}
-			}
-		}
-
-		// Apply output schema from upstream tool so direct-mode tools/list preserves
-		// the full MCP tool contract exposed by the upstream server.
-		applyToolOutputSchemaJSON(&mcpTool, tool.OutputSchemaJSON)
+		mcpTool := buildTransparentDirectTool(tool, directName)
 
 		serverTools = append(serverTools, mcpserver.ServerTool{
 			Tool:    mcpTool,
@@ -141,6 +146,7 @@ func (p *MCPProxyServer) buildDirectModeTools() []mcpserver.ServerTool {
 	}
 
 	p.setDirectToolPermissions(directToolPerms)
+	p.setDirectToolRoutes(directToolRoutes)
 
 	p.logger.Info("built direct mode tools",
 		zap.Int("tool_count", len(serverTools)))
@@ -153,143 +159,43 @@ func (p *MCPProxyServer) buildDirectModeTools() []mcpserver.ServerTool {
 func (p *MCPProxyServer) makeDirectModeHandler(serverName, toolName string, annotations *config.ToolAnnotations) mcpserver.ToolHandlerFunc {
 	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		startTime := time.Now()
-
-		// Check auth context for server access and permissions
-		authCtx := auth.AuthContextFromContext(ctx)
-		if authCtx != nil {
-			// Check server access
-			if !authCtx.CanAccessServer(serverName) {
-				return mcp.NewToolResultError(fmt.Sprintf("Access denied: token does not have access to server '%s'", serverName)), nil
-			}
-
-			// Determine required permission from annotations
-			requiredVariant := contracts.DeriveCallWith(annotations)
-			requiredPerm := contracts.ToolVariantToOperationType[requiredVariant]
-			if requiredPerm == "" {
-				requiredPerm = contracts.OperationTypeRead
-			}
-
-			if !authCtx.HasPermission(requiredPerm) {
-				return mcp.NewToolResultError(fmt.Sprintf("Permission denied: token does not have '%s' permission required for tool '%s:%s'", requiredPerm, serverName, toolName)), nil
+		if p.config == nil || !p.config.MinimalMode {
+			if authCtx := auth.AuthContextFromContext(ctx); authCtx != nil {
+				if !authCtx.CanAccessServer(serverName) {
+					return mcp.NewToolResultError(fmt.Sprintf("Access denied: token does not have access to server '%s'", serverName)), nil
+				}
+				requiredVariant := contracts.DeriveCallWith(annotations)
+				requiredPerm := contracts.ToolVariantToOperationType[requiredVariant]
+				if requiredPerm == "" {
+					requiredPerm = contracts.OperationTypeRead
+				}
+				if !authCtx.HasPermission(requiredPerm) {
+					return mcp.NewToolResultError(fmt.Sprintf("Permission denied: token does not have '%s' permission required for tool '%s:%s'", requiredPerm, serverName, toolName)), nil
+				}
 			}
 		}
 
 		// Get session ID for activity logging
-		var sessionID string
-		if sess := mcpserver.ClientSessionFromContext(ctx); sess != nil {
-			sessionID = sess.SessionID()
-		}
-
-		// Get request ID from context
-		requestID := reqcontext.GetRequestID(ctx)
+		sessionID := sessionIDFromContext(ctx)
 
 		// Get arguments from the request
 		args := request.GetArguments()
-		enrichedArgs := injectAuthMetadata(ctx, args)
-
-		// Enforce direct-mode callability before emitting a tool-started event or
-		// invoking upstream. Direct mode must not bypass disabled, quarantine, or
-		// approval controls enforced by call_tool_* variants.
-		if blocked := p.directToolCallabilityBlock(ctx, serverName, toolName, enrichedArgs); blocked != nil {
-			p.emitActivityPolicyDecision(serverName, toolName, sessionID, "blocked", "direct tool is not callable")
-			return blocked, nil
-		}
-
-		// Spec 082: a direct tool call is real work — it earns the session a
-		// durable record, and does so BEFORE any activity is emitted so the
-		// records carry the right work session.
-		p.markSessionWorked(ctx, sessionID)
-
-		// Emit activity event
-		p.emitActivityToolCallStarted(serverName, toolName, sessionID, requestID, "mcp", enrichedArgs)
 
 		// Call upstream
 		qualifiedName := serverName + ":" + toolName
 		result, err := p.upstreamManager.CallTool(ctx, qualifiedName, args)
 
-		durationMs := time.Since(startTime).Milliseconds()
-
-		// Spec 035: Determine content trust based on openWorldHint
-		directContentTrust := contracts.ContentTrustForTool(annotations)
-
 		if err != nil {
-			// Emit error activity
-			p.emitActivityToolCallCompleted(serverName, toolName, sessionID, requestID, "mcp", "error", err.Error(), durationMs, enrichedArgs, "", false, "", nil, directContentTrust, "", 0, 0, "", nil)
-			return mcp.NewToolResultError(fmt.Sprintf("Error calling %s:%s: %v", serverName, toolName, err)), nil
+			p.writeLocalCallLog(ctx, startTime, sessionID, request.Params.Name, serverName, toolName, args, nil, err)
+			return nil, err
 		}
-
-		// Determine tool variant for activity logging
-		toolVariant := contracts.DeriveCallWith(annotations)
-
-		// Forward content blocks (preserving ImageContent, AudioContent, etc.)
-		// while applying truncation only to TextContent. See issue #368.
-		//
-		// Direct mode has a simpler truncator based on ToolResponseLimit; the
-		// Truncator type (with caching) is not available here.
-		var forwarded *mcp.CallToolResult
-		var responseText string
-		var truncated bool
-		if ctr, ok := result.(*mcp.CallToolResult); ok && ctr != nil {
-			newContent := make([]mcp.Content, 0, len(ctr.Content))
-			var parts []string
-			limit := p.config.ToolResponseLimit
-			for _, c := range ctr.Content {
-				switch tc := c.(type) {
-				case mcp.TextContent:
-					txt := tc.Text
-					if limit > 0 && len(txt) > limit {
-						txt = txt[:safeTruncateBytes(txt, limit)]
-						truncated = true
-					}
-					tc.Text = txt
-					newContent = append(newContent, tc)
-					parts = append(parts, txt)
-				case mcp.ImageContent:
-					newContent = append(newContent, tc)
-					parts = append(parts, fmt.Sprintf("[image:%s len=%d]", tc.MIMEType, len(tc.Data)))
-				case mcp.AudioContent:
-					newContent = append(newContent, tc)
-					parts = append(parts, fmt.Sprintf("[audio:%s len=%d]", tc.MIMEType, len(tc.Data)))
-				default:
-					newContent = append(newContent, c)
-					if b, err := json.Marshal(c); err == nil {
-						parts = append(parts, string(b))
-					}
-				}
-			}
-			forwarded = &mcp.CallToolResult{
-				Result:            ctr.Result,
-				Content:           newContent,
-				StructuredContent: ctr.StructuredContent,
-				IsError:           ctr.IsError,
-			}
-			responseText = joinTextParts(parts)
-		} else {
-			// Fallback for non-CallToolResult values (string, struct, etc.)
-			switch v := result.(type) {
-			case string:
-				responseText = v
-			default:
-				responseBytes, marshalErr := json.Marshal(v)
-				if marshalErr != nil {
-					responseText = fmt.Sprintf("%v", v)
-				} else {
-					responseText = string(responseBytes)
-				}
-			}
-			if p.config.ToolResponseLimit > 0 && len(responseText) > p.config.ToolResponseLimit {
-				responseText = responseText[:p.config.ToolResponseLimit]
-				truncated = true
-			}
-			forwarded = mcp.NewToolResultText(responseText)
+		forwarded, ok := result.(*mcp.CallToolResult)
+		if !ok || forwarded == nil {
+			typeErr := fmt.Errorf("upstream returned unexpected result type %T", result)
+			p.writeLocalCallLog(ctx, startTime, sessionID, request.Params.Name, serverName, toolName, args, nil, typeErr)
+			return nil, typeErr
 		}
-
-		// Emit success activity
-		// Spec 069 A1: pre-truncation sizes; result was measured before the truncation loop above.
-		routingResponseBytes := rawByteSize(result)
-		routingRequestBytes := rawByteSize(enrichedArgs)
-		p.emitActivityToolCallCompleted(serverName, toolName, sessionID, requestID, "mcp", "success", "", durationMs, enrichedArgs, responseText, truncated, toolVariant, nil, directContentTrust, "", routingRequestBytes, routingResponseBytes, "", nil)
-
+		p.writeLocalCallLog(ctx, startTime, sessionID, request.Params.Name, serverName, toolName, args, forwarded, nil)
 		return forwarded, nil
 	}
 }
@@ -562,15 +468,21 @@ func (p *MCPProxyServer) initRoutingModeServers() {
 	// agent-token server/permission scope, filterDirectToolsForAgentCallability
 	// hides tools the agent could not actually invoke.
 	directOpts := append([]mcpserver.ServerOption{}, opts...)
-	directOpts = append(directOpts,
-		mcpserver.WithToolFilter(p.filterDirectModeToolsForAuth),
-		mcpserver.WithToolFilter(p.filterDirectToolsForAgentCallability),
-	)
+	if !p.config.MinimalMode {
+		directOpts = append(directOpts,
+			mcpserver.WithToolFilter(p.filterDirectModeToolsForAuth),
+			mcpserver.WithToolFilter(p.filterDirectToolsForAgentCallability),
+		)
+	}
 	p.directServer = mcpserver.NewMCPServer(
 		"mcpproxy-go",
 		mcpServerVersion(),
 		directOpts...,
 	)
+	if p.config.MinimalMode {
+		p.logger.Info("minimal direct routing mode initialized")
+		return
+	}
 
 	// Create code execution mode server
 	p.codeExecServer = mcpserver.NewMCPServer(

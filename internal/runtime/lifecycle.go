@@ -18,6 +18,20 @@ const connectAttemptTimeout = 3*time.Minute + 15*time.Second // Must exceed per-
 
 // StartBackgroundInitialization kicks off configuration sync and background loops.
 func (r *Runtime) StartBackgroundInitialization() {
+	// The controller MVP needs upstream lifecycle and tool discovery only. Skip
+	// telemetry, activity DB, update, OAuth-refresh and supervisor subsystems;
+	// the transparent JSONL call log lives at the forwarding boundary instead.
+	if cfg := r.Config(); cfg != nil && cfg.MinimalMode {
+		if r.upstreamManager != nil {
+			r.upstreamManager.SetToolDiscoveryCallback(func(ctx context.Context, serverName string) error {
+				return r.DiscoverAndIndexToolsForServer(ctx, serverName)
+			})
+		}
+		go r.backgroundInitialization()
+		r.logger.Info("minimal proxy background initialization started")
+		return
+	}
+
 	// Start activity service for persisting tool call events
 	if r.activityService != nil {
 		// Set event emitter for sensitive data detection events (Spec 026)
@@ -449,6 +463,12 @@ func (r *Runtime) discoverAndIndexTools(ctx context.Context, dueOnly bool) error
 	r.reconcileProfileIndexes()
 
 	r.logger.Info("Successfully indexed tools", zap.Int("count", len(tools)))
+	if cfg := r.Config(); cfg != nil && cfg.MinimalMode {
+		r.emitServersChanged("tools_indexed", map[string]any{
+			"reason":     "tool_discovery_complete",
+			"tool_count": len(tools),
+		})
+	}
 	return nil
 }
 
@@ -627,6 +647,13 @@ func (r *Runtime) discoverAndIndexToolsForServer(ctx context.Context, serverName
 	r.logger.Info("Successfully indexed tools for server",
 		zap.String("server", serverName),
 		zap.Int("count", len(tools)))
+	if cfg := r.Config(); cfg != nil && cfg.MinimalMode {
+		r.emitServersChanged("tools_indexed", map[string]any{
+			"reason":     "server_tool_discovery_complete",
+			"server":     serverName,
+			"tool_count": len(tools),
+		})
+	}
 	return nil
 }
 

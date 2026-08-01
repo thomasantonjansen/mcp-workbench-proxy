@@ -17,6 +17,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/auth"
@@ -617,6 +618,11 @@ func (s *Server) setupRoutes() {
 	// Always register /ready as backup endpoint for tray compatibility
 	s.router.Get("/ready", readinessHandler)
 
+	minimalMode := false
+	if cfg, ok := s.controller.GetCurrentConfig().(*config.Config); ok && cfg != nil {
+		minimalMode = cfg.MinimalMode
+	}
+
 	// API v1 routes with timeout and authentication middleware
 	s.router.Route("/api/v1", func(r chi.Router) {
 		// Apply timeout and API key authentication middleware to API routes only
@@ -626,9 +632,19 @@ func (s *Server) setupRoutes() {
 		// a closure so the registry can be installed after route setup.
 		r.Use(SurfaceClassifierMiddleware(func() *telemetry.CounterRegistry { return s.telemetryRegistry }))
 		r.Use(RESTEndpointHistogramMiddleware(func() *telemetry.CounterRegistry { return s.telemetryRegistry }))
+		if minimalMode {
+			s.setupMinimalAPIRoutes(r)
+			return
+		}
 
 		// Status endpoint
+		r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
+			s.writeJSON(w, http.StatusOK, map[string]interface{}{
+				"status": "ok", "ready": s.controller.IsReady(),
+			})
+		})
 		r.Get("/status", s.handleGetStatus)
+		r.Put("/logging", s.handlePutLocalCallLogging)
 
 		// Info endpoint (server version, web UI URL, etc.)
 		r.Get("/info", s.handleGetInfo)
@@ -668,7 +684,8 @@ func (s *Server) setupRoutes() {
 			r.Use(decodeServerIDParam)
 			// Mutating per-server routes carry the shared agent-token gate
 			// (issues #877/#878).
-			r.Patch("/", s.requireServerOp(auth.ServerOpPatch, s.handlePatchServer))                                   // Partial update server config
+			r.Patch("/", s.requireServerOp(auth.ServerOpPatch, s.handlePatchServer)) // Partial update server config
+			r.Put("/", s.requireServerOp(auth.ServerOpPatch, s.handlePatchServer))
 			r.Delete("/", s.requireServerOp(auth.ServerOpRemove, s.handleRemoveServer))                                // T002: Remove server
 			r.Post("/config-to-secret", s.requireServerOp(auth.ServerOpConfigToSecret, s.handleConvertConfigToSecret)) // Move a header / env value into OS keyring
 			r.Post("/enable", s.requireServerOp(auth.ServerOpEnable, s.handleEnableServer))
@@ -679,6 +696,7 @@ func (s *Server) setupRoutes() {
 			r.Post("/quarantine", s.requireServerOp(auth.ServerOpQuarantine, s.handleQuarantineServer))
 			r.Post("/unquarantine", s.requireServerOp(auth.ServerOpUnquarantine, s.handleUnquarantineServer))
 			r.Post("/discover-tools", s.requireServerOp(auth.ServerOpDiscoverTools, s.handleDiscoverServerTools))
+			r.Post("/refresh-tools", s.requireServerOp(auth.ServerOpDiscoverTools, s.handleDiscoverServerTools))
 			// Alias of discover-tools named for the upstream_servers 'refresh'
 			// operation (issue #873): pure rediscover + reindex, no state change.
 			r.Post("/refresh", s.requireServerOp(auth.ServerOpRefresh, s.handleRefreshServer))
@@ -855,9 +873,12 @@ func (s *Server) setupRoutes() {
 		})
 	})
 
-	// SSE events (protected by API key) - support both GET and HEAD
-	s.router.With(s.apiKeyAuthMiddleware()).Method("GET", "/events", http.HandlerFunc(s.handleSSEEvents))
-	s.router.With(s.apiKeyAuthMiddleware()).Method("HEAD", "/events", http.HandlerFunc(s.handleSSEEvents))
+	if !minimalMode {
+		// SSE events are a legacy web-UI surface and are not exposed by the
+		// controller-owned minimal proxy.
+		s.router.With(s.apiKeyAuthMiddleware()).Method("GET", "/events", http.HandlerFunc(s.handleSSEEvents))
+		s.router.With(s.apiKeyAuthMiddleware()).Method("HEAD", "/events", http.HandlerFunc(s.handleSSEEvents))
+	}
 
 	// Note: Swagger UI is mounted directly on the main mux (not via HTTP API server)
 	// See internal/server/server.go for swagger handler registration
@@ -866,6 +887,224 @@ func (s *Server) setupRoutes() {
 		"api_routes", "/api/v1/*",
 		"sse_route", "/events",
 		"health_routes", "/healthz,/readyz,/livez,/ready")
+}
+
+func (s *Server) setupMinimalAPIRoutes(r chi.Router) {
+	r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
+		s.writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status": "ok", "ready": s.controller.IsReady(),
+		})
+	})
+	r.Get("/status", s.handleGetStatus)
+	r.Put("/logging", s.handlePutLocalCallLogging)
+	r.Get("/servers", s.handleGetMinimalServers)
+	r.Post("/servers", s.requireServerOp(auth.ServerOpAdd, s.handleAddServer))
+	decoded := r.With(decodeServerIDParam)
+	byName := r.With(decodeServerIDParam, s.resolveMinimalServerID)
+	byName.Put("/servers/{id}", s.requireServerOp(auth.ServerOpPatch, s.handlePatchServer))
+	byName.Delete("/servers/{id}", s.requireServerOp(auth.ServerOpRemove, s.handleRemoveServer))
+	byName.Post("/servers/{id}/enable", s.requireServerOp(auth.ServerOpEnable, s.handleEnableServer))
+	byName.Post("/servers/{id}/disable", s.requireServerOp(auth.ServerOpDisable, s.handleDisableServer))
+	byName.Post("/servers/{id}/restart", s.requireServerOp(auth.ServerOpRestart, s.handleRestartServer))
+	byName.Post("/servers/{id}/refresh-tools", s.requireServerOp(auth.ServerOpDiscoverTools, s.handleDiscoverServerTools))
+	decoded.Get("/servers/{id}/tools", s.handleGetControllerServerTools)
+	decoded.Put("/servers/{id}/tool-visibility", s.handlePutToolVisibility)
+	decoded.Put("/servers/{id}/publications", s.handlePutPublications)
+}
+
+func (s *Server) handleGetMinimalServers(w http.ResponseWriter, r *http.Request) {
+	cfg, err := s.controller.GetConfig()
+	if err != nil || cfg == nil {
+		s.writeError(w, r, http.StatusInternalServerError, "Failed to get proxy configuration")
+		return
+	}
+	statusByName := map[string]interface{}{}
+	if stats := s.controller.GetUpstreamStats(); stats != nil {
+		if values, ok := stats["servers"].(map[string]interface{}); ok {
+			statusByName = values
+		}
+	}
+	servers := make([]map[string]interface{}, 0, len(cfg.Servers))
+	for _, configured := range cfg.Servers {
+		if configured == nil {
+			continue
+		}
+		encoded, _ := json.Marshal(configured)
+		entry := map[string]interface{}{}
+		_ = json.Unmarshal(encoded, &entry)
+		entry["id"] = configured.StableID()
+		entry["connected"] = false
+		entry["tool_count"] = 0
+		if raw, ok := statusByName[configured.Name].(map[string]interface{}); ok {
+			for _, key := range []string{"connected", "connecting", "tool_count", "last_error", "state"} {
+				if value, exists := raw[key]; exists {
+					entry[key] = value
+				}
+			}
+		}
+		servers = append(servers, entry)
+	}
+	s.writeSuccess(w, map[string]interface{}{"servers": servers})
+}
+
+func (s *Server) minimalServerByID(id string) (*config.Config, *config.ServerConfig, error) {
+	cfg, err := s.controller.GetConfig()
+	if err != nil || cfg == nil {
+		return nil, nil, fmt.Errorf("failed to read configuration")
+	}
+	for _, server := range cfg.Servers {
+		if server != nil && server.StableID() == id {
+			return cfg, server, nil
+		}
+	}
+	return cfg, nil, fmt.Errorf("server not found: %s", id)
+}
+
+func cloneMinimalConfig(cfg *config.Config, serverID string) (*config.Config, *config.ServerConfig, error) {
+	encoded, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	var cloned config.Config
+	if err := json.Unmarshal(encoded, &cloned); err != nil {
+		return nil, nil, err
+	}
+	for _, server := range cloned.Servers {
+		if server != nil && server.StableID() == serverID {
+			return &cloned, server, nil
+		}
+	}
+	return &cloned, nil, fmt.Errorf("server not found: %s", serverID)
+}
+
+func (s *Server) handleGetControllerServerTools(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	_, serverCfg, err := s.minimalServerByID(id)
+	if err != nil {
+		s.writeError(w, r, http.StatusNotFound, err.Error())
+		return
+	}
+	tools, err := s.controller.GetServerTools(serverCfg.Name)
+	if err != nil {
+		s.writeError(w, r, http.StatusConflict, err.Error())
+		return
+	}
+	hidden := map[string]bool{}
+	for _, name := range serverCfg.AgentHiddenTools {
+		hidden[name] = true
+	}
+	for _, tool := range tools {
+		name, _ := tool["name"].(string)
+		tool["visible_to_agents"] = !hidden[name]
+		tool["server_id"] = id
+	}
+	s.writeSuccess(w, map[string]interface{}{"tools": tools})
+}
+
+func (s *Server) handlePutToolVisibility(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var body struct {
+		ToolName        string `json:"tool_name"`
+		VisibleToAgents *bool  `json:"visible_to_agents"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ToolName == "" || body.VisibleToAgents == nil {
+		s.writeError(w, r, http.StatusBadRequest, "tool_name and visible_to_agents are required")
+		return
+	}
+	cfg, serverCfg, err := s.minimalServerByID(id)
+	if err != nil {
+		s.writeError(w, r, http.StatusNotFound, err.Error())
+		return
+	}
+	tools, err := s.controller.GetServerTools(serverCfg.Name)
+	if err != nil {
+		s.writeError(w, r, http.StatusConflict, err.Error())
+		return
+	}
+	found := false
+	for _, tool := range tools {
+		if tool["name"] == body.ToolName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		s.writeError(w, r, http.StatusNotFound, "raw MCP tool was not found")
+		return
+	}
+	updated, target, err := cloneMinimalConfig(cfg, id)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, err.Error())
+		return
+	}
+	hidden := map[string]bool{}
+	for _, name := range target.AgentHiddenTools {
+		hidden[name] = true
+	}
+	if *body.VisibleToAgents {
+		delete(hidden, body.ToolName)
+	} else {
+		hidden[body.ToolName] = true
+	}
+	target.AgentHiddenTools = target.AgentHiddenTools[:0]
+	for name := range hidden {
+		target.AgentHiddenTools = append(target.AgentHiddenTools, name)
+	}
+	sort.Strings(target.AgentHiddenTools)
+	if _, err := s.controller.ApplyConfig(updated, s.controller.GetConfigPath()); err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("failed to update tool visibility: %v", err))
+		return
+	}
+	s.writeSuccess(w, map[string]interface{}{"tool_name": body.ToolName, "visible_to_agents": *body.VisibleToAgents})
+}
+
+func (s *Server) handlePutPublications(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var body struct {
+		Callback *config.PublicationCallbackConfig `json:"callback"`
+		Tools    []config.PublishedToolConfig      `json:"tools"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "invalid publication payload")
+		return
+	}
+	cfg, serverCfg, err := s.minimalServerByID(id)
+	if err != nil {
+		s.writeError(w, r, http.StatusNotFound, err.Error())
+		return
+	}
+	rawTools, _ := s.controller.GetServerTools(serverCfg.Name)
+	names := map[string]bool{}
+	for _, tool := range rawTools {
+		if name, ok := tool["name"].(string); ok {
+			names[name] = true
+		}
+	}
+	publicationIDs := map[string]bool{}
+	for _, publication := range body.Tools {
+		if publication.PublicationID == "" || publication.Name == "" || len(publication.Tool) == 0 {
+			s.writeError(w, r, http.StatusBadRequest, "each publication requires publication_id, name and tool")
+			return
+		}
+		if names[publication.Name] || publicationIDs[publication.PublicationID] {
+			s.writeError(w, r, http.StatusConflict, "published tool name or publication id collides")
+			return
+		}
+		names[publication.Name] = true
+		publicationIDs[publication.PublicationID] = true
+	}
+	updated, target, err := cloneMinimalConfig(cfg, id)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, err.Error())
+		return
+	}
+	target.Publications = body.Tools
+	target.PublicationCallback = body.Callback
+	if _, err := s.controller.ApplyConfig(updated, s.controller.GetConfigPath()); err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("failed to publish tools: %v", err))
+		return
+	}
+	s.writeSuccess(w, map[string]interface{}{"count": len(body.Tools)})
 }
 
 // httpLoggingMiddleware creates custom HTTP request logging middleware
@@ -1559,6 +1798,7 @@ func (s *Server) handleAddServer(w http.ResponseWriter, r *http.Request) {
 	// ADD ignores null entries — `null` is JSON Merge Patch's "delete"
 	// signal which has no meaning on create. Drop nils when flattening.
 	serverConfig := &config.ServerConfig{
+		ID:          uuid.NewString(),
 		Name:        req.Name,
 		URL:         req.URL,
 		Command:     req.Command,
@@ -4064,6 +4304,40 @@ func (s *Server) handleApplyConfig(w http.ResponseWriter, r *http.Request) {
 	s.writeSuccess(w, response)
 }
 
+// handlePutLocalCallLogging toggles the MVP's local, full-payload JSONL call
+// log without exposing or accepting the rest of the proxy configuration.
+func (s *Server) handlePutLocalCallLogging(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "Invalid JSON payload")
+		return
+	}
+	cfg, err := s.controller.GetConfig()
+	if err != nil || cfg == nil {
+		s.writeError(w, r, http.StatusInternalServerError, "Failed to read configuration")
+		return
+	}
+	updated := *cfg
+	if cfg.Logging == nil {
+		updated.Logging = &config.LogConfig{}
+	} else {
+		loggingCopy := *cfg.Logging
+		updated.Logging = &loggingCopy
+	}
+	updated.Logging.Enabled = body.Enabled
+	result, err := s.controller.ApplyConfig(&updated, s.controller.GetConfigPath())
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to update logging: %v", err))
+		return
+	}
+	s.writeSuccess(w, map[string]interface{}{
+		"enabled":          body.Enabled,
+		"restart_required": result.RequiresRestart,
+	})
+}
+
 // handlePatchDockerIsolation godoc
 // @Summary      Toggle global Docker isolation
 // @Description  Convenience endpoint to flip `docker_isolation.enabled` without resending the full config. Persists to disk via the existing config writer — the file watcher then hot-reloads the change. Returns the new state and whether a restart is required for existing connections to pick it up.
@@ -4493,6 +4767,30 @@ func decodeServerIDParam(next http.Handler) http.Handler {
 			for i, k := range rctx.URLParams.Keys {
 				if k == "id" {
 					rctx.URLParams.Values[i] = decodePathParam(rctx.URLParams.Values[i])
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// resolveMinimalServerID lets the existing upstream lifecycle handlers keep
+// using server names while the controller API exposes immutable UUIDs.
+func (s *Server) resolveMinimalServerID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rctx := chi.RouteContext(r.Context())
+		if rctx != nil {
+			cfg, _ := s.controller.GetConfig()
+			for i, key := range rctx.URLParams.Keys {
+				if key != "id" || cfg == nil {
+					continue
+				}
+				id := rctx.URLParams.Values[i]
+				for _, server := range cfg.Servers {
+					if server != nil && server.StableID() == id {
+						rctx.URLParams.Values[i] = server.Name
+						break
+					}
 				}
 			}
 		}
